@@ -1,0 +1,19 @@
+name: Validate workflows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out workflow repository
+        uses: actions/checkout@v6
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.7
