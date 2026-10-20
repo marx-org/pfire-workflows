@@ -1,0 +1,202 @@
+name: Reusable multi-architecture Docker image
+
+on:
+  workflow_call:
+    inputs:
+      release_branch:
+        description: Branch whose pushes create a release and publish the production image.
+        required: false
+        type: string
+        default: main
+      release_on_workflow_dispatch:
+        description: Create a release when the caller invokes this workflow manually.
+        required: false
+        type: boolean
+        default: false
+      test_command:
+        description: Bash script that installs dependencies and runs the caller's tests.
+        required: false
+        type: string
+        default: ''
+      node_version:
+        description: Node.js version to install before running test_command, or empty.
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        description: Dockerfile path relative to the caller repository.
+        required: false
+        type: string
+        default: Dockerfile
+      build_context:
+        description: Docker build context relative to the caller repository.
+        required: false
+        type: string
+        default: .
+      build_args:
+        description: Additional newline-separated Docker build arguments.
+        required: false
+        type: string
+        default: ''
+      image_suffix:
+        description: Optional suffix appended to the caller repository image name.
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: Comma-separated Buildx target platforms.
+        required: false
+        type: string
+        default: linux/amd64,linux/arm64
+      publish_release:
+        description: Whether the standard tag and GitHub Release job is enabled.
+        required: false
+        type: boolean
+        default: true
+      cache_scope:
+        description: Optional unique GitHub Actions cache scope.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      package_token:
+        description: Optional token for private package installation; GITHUB_TOKEN is the fallback.
+        required: false
+    outputs:
+      version:
+        description: Release tag created by the reusable workflow, or empty for non-release builds.
+        value: ${{ jobs.release.outputs.version }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Test
+    if: ${{ inputs.test_command != '' && !contains(github.event.head_commit.message, '[ci-skip]') }}
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.package_token || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        if: ${{ inputs.node_version != '' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          registry-url: https://npm.pkg.github.com
+          scope: '@marx-org'
+
+      - name: Run caller test command
+        shell: bash
+        run: |
+          set -euo pipefail
+          ${{ inputs.test_command }}
+
+  release:
+    name: Release
+    needs: test
+    if: >-
+      always() &&
+      inputs.publish_release &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.release_on_workflow_dispatch)) &&
+      github.ref == format('refs/heads/{0}', inputs.release_branch) &&
+      !contains(github.event.head_commit.message, '[ci-skip]') &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine next version
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest="$(git tag --list 'v*' --sort=-version:refname | head -n1)"
+          if [[ -z "$latest" ]]; then
+            next='v1.0.0'
+          else
+            IFS='.' read -r major minor patch <<< "${latest#v}"
+            next="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.bump.outputs.version }}
+          name: Release ${{ steps.bump.outputs.version }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build and publish multi-architecture image
+    needs: [test, release]
+    if: >-
+      always() &&
+      !contains(github.event.head_commit.message, '[ci-skip]') &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (github.event_name == 'pull_request' ||
+       (github.event_name == 'push' && needs.release.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (!inputs.publish_release || !inputs.release_on_workflow_dispatch || needs.release.result == 'success')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@v6
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}${{ inputs.image_suffix }}
+          tags: |
+            type=ref,event=pr
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.release.outputs.version }},enable=${{ needs.release.outputs.version != '' }}
+
+      - name: Build and push multi-architecture image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ needs.release.outputs.version }}
+            ${{ inputs.build_args }}
+          secrets: |
+            NODE_AUTH_TOKEN=${{ secrets.package_token || secrets.GITHUB_TOKEN }}
+          cache-from: type=gha,scope=${{ inputs.cache_scope || format('{0}{1}', github.repository, inputs.image_suffix) }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.cache_scope || format('{0}{1}', github.repository, inputs.image_suffix) }}
