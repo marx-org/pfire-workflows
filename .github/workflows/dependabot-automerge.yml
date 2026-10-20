@@ -1,0 +1,138 @@
+name: Dependabot safe auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      require_dependency_review:
+        description: Require a dependency-review check before automatic merging.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  request-copilot:
+    name: Request Copilot review
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Request Copilot as reviewer
+        id: copilot
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+            --input - <<'JSON'
+          {"reviewers":["copilot-pull-request-reviewer[bot]"]}
+          JSON
+
+      - name: Record Copilot availability limitation
+        if: steps.copilot.outcome == 'failure'
+        run: |
+          echo '::warning::Copilot review is not available for this repository or plan; safe auto-merge remains disabled until an approving Copilot review exists.'
+
+  auto-merge:
+    name: Merge low-risk update
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      (github.event_name == 'pull_request_target' || github.event_name == 'pull_request_review')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+    steps:
+      - name: Read Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Check Copilot approval and completed checks
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          PACKAGE_ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          REQUIRE_DEPENDENCY_REVIEW: ${{ inputs.require_dependency_review }}
+        run: |
+          set -euo pipefail
+
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor)
+              ;;
+            *)
+              echo "Not a low-risk update: ${UPDATE_TYPE:-unknown}"
+              exit 0
+              ;;
+          esac
+
+          case "$PACKAGE_ECOSYSTEM" in
+            npm|pip|docker|github-actions)
+              ;;
+            *)
+              echo "Unsupported ecosystem for automatic merge: ${PACKAGE_ECOSYSTEM:-unknown}"
+              exit 0
+              ;;
+          esac
+
+          head_sha="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.head.sha')"
+          copilot_approval="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --jq '.[]' | jq -s --arg head "$head_sha" '[.[] | select(.user.login == "copilot-pull-request-reviewer[bot]" and .state == "APPROVED" and .commit_id == $head)] | length')"
+          if [[ "$copilot_approval" != 1 ]]; then
+            echo 'Waiting for an approving Copilot review on the current commit.'
+            exit 0
+          fi
+
+          checks_json="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/check-runs" --jq '.check_runs[]' | jq -s -c '.')"
+          check_count=0
+          pending_count=0
+          failed_count=0
+          dependency_review_count=0
+          while IFS= read -r check; do
+            [[ -n "$check" ]] || continue
+            check_count=$((check_count + 1))
+            name="$(jq -r '.name' <<<"$check")"
+            status="$(jq -r '.status' <<<"$check")"
+            conclusion="$(jq -r '.conclusion // empty' <<<"$check")"
+            [[ "${name,,}" == *dependency*review* ]] && dependency_review_count=$((dependency_review_count + 1))
+            [[ "$status" == completed ]] || pending_count=$((pending_count + 1))
+            case "$conclusion" in
+              success|neutral|skipped|"")
+                ;;
+              *)
+                failed_count=$((failed_count + 1))
+                ;;
+            esac
+          done < <(jq -c '.[]' <<<"$checks_json")
+
+          if (( check_count == 0 || pending_count > 0 || failed_count > 0 )); then
+            echo "Checks are not ready: count=${check_count} pending=${pending_count} failed=${failed_count}."
+            exit 0
+          fi
+          if [[ "$REQUIRE_DEPENDENCY_REVIEW" == true ]] && (( dependency_review_count == 0 )); then
+            echo 'Dependency review check is missing; refusing automatic merge.'
+            exit 0
+          fi
+
+          echo 'All safe auto-merge gates passed.'
+
+      - name: Enable squash auto-merge
+        if: steps.gate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
