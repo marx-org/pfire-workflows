@@ -2,6 +2,12 @@ name: Dependabot safe auto-merge
 
 on:
   workflow_call:
+    inputs:
+      require_dependency_review:
+        description: Require a dependency-review check before automatic merging.
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -62,6 +68,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           PACKAGE_ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          REQUIRE_DEPENDENCY_REVIEW: ${{ inputs.require_dependency_review }}
         run: |
           set -euo pipefail
 
@@ -116,7 +123,7 @@ jobs:
             echo "Checks are not ready: count=${check_count} pending=${pending_count} failed=${failed_count}."
             exit 0
           fi
-          if (( dependency_review_count == 0 )); then
+          if [[ "$REQUIRE_DEPENDENCY_REVIEW" == true ]] && (( dependency_review_count == 0 )); then
             echo 'Dependency review check is missing; refusing automatic merge.'
             exit 0
           fi
