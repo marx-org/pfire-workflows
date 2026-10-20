@@ -60,3 +60,31 @@ must verify both manifest platforms with:
 ```sh
 docker buildx imagetools inspect ghcr.io/marx-org/<image>:<tag>
 ```
+
+## Node base-image mirror
+
+`base-image-mirror.yml` copies the official multi-architecture `node:22-alpine` manifest
+to `ghcr.io/marx-org/base-node:22-alpine` without rebuilding or changing its layers. It
+adds the OCI source annotation needed to link the GHCR package to this repository, so the
+destination index digest can differ from the source index digest while every manifest
+descriptor remains identical. It runs nightly and can be dispatched manually:
+
+```sh
+gh workflow run base-image-mirror.yml \
+  --repo marx-org/pfire-workflows \
+  -f source_ref=node:22-alpine \
+  -f destination_tag=22-alpine
+```
+
+The workflow resolves the source digest before copying, copies from that immutable digest,
+and then checks that the source tag did not move, that the destination manifest descriptors
+are identical, and that both required Linux platforms are present. It prints both index
+digests for the fleet audit. The default source can be replaced by an explicit
+`node:22-alpine@sha256:<digest>` when recovering a known-good version.
+
+The first successful run creates the `base-node` GHCR package and links it to
+`marx-org/pfire-workflows`; an organization owner must make the package public in its
+settings before consumer migrations are merged. Keep consumer `FROM` lines pinned to the
+verified destination digest; the mutable `22-alpine` tag is only for mirror maintenance.
+If upstream is down, leave consumers on their last-known-good digest and do not repoint the
+tag until a source digest has been verified.

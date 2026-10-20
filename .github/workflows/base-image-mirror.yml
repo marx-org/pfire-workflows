@@ -1,0 +1,119 @@
+name: Mirror Node base image
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Official Node image reference to mirror
+        required: true
+        type: string
+        default: node:22-alpine
+      destination_tag:
+        description: Tag to publish in ghcr.io/marx-org/base-node
+        required: true
+        type: string
+        default: 22-alpine
+
+concurrency:
+  group: base-image-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: Copy the official Node manifest
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REF: ${{ inputs.source_ref || 'node:22-alpine' }}
+      DESTINATION_TAG: ${{ inputs.destination_tag || '22-alpine' }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Inspect the source manifest before copying
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_digest="$(docker buildx imagetools inspect "$SOURCE_REF" --format '{{.Manifest.Digest}}')"
+          [[ "$source_digest" == sha256:* ]] || {
+            echo "The source reference did not resolve to a digest: $source_digest" >&2
+            exit 1
+          }
+
+          docker buildx imagetools inspect --raw "$SOURCE_REF" > "$RUNNER_TEMP/source-manifest.json"
+          jq -e 'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "amd64")' \
+            "$RUNNER_TEMP/source-manifest.json" >/dev/null
+          jq -e 'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64")' \
+            "$RUNNER_TEMP/source-manifest.json" >/dev/null
+
+          if [[ "$SOURCE_REF" == *@* ]]; then
+            source_immutable="$SOURCE_REF"
+          else
+            source_immutable="${SOURCE_REF}@${source_digest}"
+          fi
+
+          {
+            echo "digest=$source_digest"
+            echo "immutable_ref=$source_immutable"
+          } >> "$GITHUB_OUTPUT"
+          echo "Upstream source digest: $source_digest"
+
+      - name: Copy the manifest without rebuilding it
+        shell: bash
+        env:
+          SOURCE_IMMUTABLE: ${{ steps.source.outputs.immutable_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$DESTINATION_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid destination tag: $DESTINATION_TAG" >&2
+            exit 1
+          fi
+
+          destination="ghcr.io/marx-org/base-node:${DESTINATION_TAG}"
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --tag "$destination" "$SOURCE_IMMUTABLE"
+          echo "Published $destination from $SOURCE_IMMUTABLE"
+
+      - name: Verify source and destination digests
+        shell: bash
+        env:
+          SOURCE_DIGEST: ${{ steps.source.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          destination="ghcr.io/marx-org/base-node:${DESTINATION_TAG}"
+          docker buildx imagetools inspect --raw "$destination" > "$RUNNER_TEMP/destination-manifest.json"
+          destination_digest="$(docker buildx imagetools inspect "$destination" --format '{{.Manifest.Digest}}')"
+          source_digest_after="$(docker buildx imagetools inspect "$SOURCE_REF" --format '{{.Manifest.Digest}}')"
+
+          if [[ "$source_digest_after" != "$SOURCE_DIGEST" ]]; then
+            echo "The source tag changed while it was being mirrored: $SOURCE_DIGEST -> $source_digest_after" >&2
+            exit 1
+          fi
+          source_manifests="$(jq -S '.manifests' "$RUNNER_TEMP/source-manifest.json")"
+          destination_manifests="$(jq -S '.manifests' "$RUNNER_TEMP/destination-manifest.json")"
+          if [[ "$source_manifests" != "$destination_manifests" ]]; then
+            echo 'The destination manifest descriptors do not match the source.' >&2
+            diff -u <(printf '%s\n' "$source_manifests") <(printf '%s\n' "$destination_manifests") || true
+            exit 1
+          fi
+
+          echo "Upstream digest:   $SOURCE_DIGEST"
+          echo "Mirror digest:     $destination_digest"
+          echo "Destination image: $destination"
