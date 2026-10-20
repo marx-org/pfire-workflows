@@ -33,7 +33,12 @@ jobs:
 The workflow defaults to `linux/amd64,linux/arm64`, creates a single GHCR manifest,
 and uses the caller's `github.repository` for the image name. A caller can override
 the Dockerfile/context, release branch, test command, build arguments, image suffix,
-cache scope, and release behavior through `workflow_call` inputs.
+preview tag, cache scope, and release behavior through `workflow_call` inputs.
+
+Develop callers set `release_branch: develop`, `publish_release: false`, and
+`preview_tag: develop`. They still pass their full repository test command; the
+shared workflow skips only release/tag creation and publishes the immutable SHA
+tag plus the moving `develop` tag.
 
 `package_token` is optional. The workflow falls back to the caller's automatic
 `GITHUB_TOKEN`; callers that install private packages should grant `packages: read`

@@ -43,6 +43,11 @@ on:
         required: false
         type: string
         default: ''
+      preview_tag:
+        description: Optional moving tag for non-release preview pushes, such as develop.
+        required: false
+        type: string
+        default: ''
       platforms:
         description: Comma-separated Buildx target platforms.
         required: false
@@ -184,6 +189,7 @@ jobs:
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=${{ needs.release.outputs.version }},enable=${{ needs.release.outputs.version != '' }}
+            type=raw,value=${{ inputs.preview_tag }},enable=${{ inputs.preview_tag != '' }}
 
       - name: Build and push multi-architecture image
         uses: docker/build-push-action@v7
