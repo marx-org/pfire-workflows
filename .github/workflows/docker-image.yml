@@ -69,13 +69,14 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test:
     name: Test
     if: ${{ inputs.test_command != '' && !contains(github.event.head_commit.message, '[ci-skip]') }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       NODE_AUTH_TOKEN: ${{ secrets.package_token || secrets.GITHUB_TOKEN }}
     steps:
