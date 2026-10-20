@@ -149,7 +149,8 @@ jobs:
       !contains(github.event.head_commit.message, '[ci-skip]') &&
       (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (github.event_name == 'pull_request' ||
-       (github.event_name == 'push' && needs.release.result == 'success') ||
+       (github.event_name == 'push' &&
+        (!inputs.publish_release || needs.release.result == 'success')) ||
        (github.event_name == 'workflow_dispatch' &&
         (!inputs.publish_release || !inputs.release_on_workflow_dispatch || needs.release.result == 'success')))
     runs-on: ubuntu-latest
