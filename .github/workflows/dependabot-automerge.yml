@@ -71,6 +71,7 @@ jobs:
           REQUIRE_DEPENDENCY_REVIEW: ${{ inputs.require_dependency_review }}
         run: |
           set -euo pipefail
+          echo 'merge_allowed=false' >> "$GITHUB_OUTPUT"
 
           case "$UPDATE_TYPE" in
             version-update:semver-patch|version-update:semver-minor)
@@ -129,10 +130,14 @@ jobs:
           fi
 
           echo 'All safe auto-merge gates passed.'
+          echo 'merge_allowed=true' >> "$GITHUB_OUTPUT"
 
       - name: Enable squash auto-merge
-        if: steps.gate.outcome == 'success'
+        if: steps.gate.outputs.merge_allowed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash
+        run: |
+          if ! gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash; then
+            echo '::warning::Automatic merging is unavailable for this repository or branch; no merge was attempted.'
+          fi
